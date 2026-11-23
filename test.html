@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GPST RX map: parser tests</title>
+<style>
+  body { font: 14px/1.4 system-ui, sans-serif; margin: 16px; background: #fff; color: #111; }
+  .pass { color: #0a7d32; } .fail { color: #b3261e; font-weight: 600; }
+  pre { white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<h1>Parser tests</h1>
+<p id="summary">Running…</p>
+<pre id="out"></pre>
+<script type="module">
+import {
+  parseLine, makePacket, LineSplitter, ReportBuilder, distanceM, bearingDeg, lipoPercent, flagNames, toGpx,
+} from './nmea.js';
+
+const results = [];
+function test(name, fn) {
+  try { fn(); results.push([true, name]); } catch (e) { results.push([false, `${name}: ${e.message}`]); }
+}
+function eq(a, b, msg = '') {
+  if (a !== b) throw new Error(`${msg} expected ${JSON.stringify(b)}, got ${JSON.stringify(a)}`);
+}
+function near(a, b, tol, msg = '') {
+  if (Math.abs(a - b) > tol) throw new Error(`${msg} expected ${b} +/- ${tol}, got ${a}`);
+}
+
+// Fixtures: the expected strings of firmware/tests/nmea_out/src/main.c.
+const FW = {
+  rmc: '$GPRMC,,A,4548.90000,N,01558.91400,E,,,,,,A*71\r\n',
+  rmcSW: '$GPRMC,,A,3352.12800,S,15112.55800,W,,,,,,A*7D\r\n',
+  rmcNoFix: '$GPRMC,,V,,,,,,,,,,N*53\r\n',
+  gga: '$GPGGA,,4548.90000,N,01558.91400,E,1,08,1.2,123.0,M,,M,,*56\r\n',
+  ggaNoFix: '$GPGGA,,,,,,0,00,,,M,,M,,*66\r\n',
+  st: '$PGPST,0A1B2C3D,42,3700,-97,7,01,3*4C\r\n',
+};
+
+test('RMC from the firmware test', () => {
+  const m = parseLine(FW.rmc);
+  eq(m.type, 'RMC'); eq(m.valid, true);
+  near(m.lat, 45.815, 1e-9, 'lat'); near(m.lon, 15.9819, 1e-9, 'lon');
+});
+test('RMC south and west', () => {
+  const m = parseLine(FW.rmcSW);
+  eq(m.valid, true); near(m.lat, -33.8688, 1e-9, 'lat'); near(m.lon, -151.2093, 1e-9, 'lon');
+});
+test('RMC without a fix', () => {
+  const m = parseLine(FW.rmcNoFix);
+  eq(m.type, 'RMC'); eq(m.valid, false); eq(m.lat, null);
+});
+test('GGA from the firmware test', () => {
+  const m = parseLine(FW.gga);
+  eq(m.type, 'GGA'); eq(m.quality, 1); eq(m.sats, 8); eq(m.hdop, 1.2); eq(m.altM, 123);
+});
+test('GGA without a fix', () => {
+  const m = parseLine(FW.ggaNoFix);
+  eq(m.type, 'GGA'); eq(m.quality, 0); eq(m.lat, null);
+});
+test('PGPST from the firmware test', () => {
+  const m = parseLine(FW.st);
+  eq(m.type, 'PGPST'); eq(m.id, '0A1B2C3D'); eq(m.seq, 42); eq(m.battMv, 3700);
+  eq(m.rssi, -97); eq(m.snr, 7); eq(m.flags, 1); eq(m.lost, 3);
+});
+test('Bad checksum is an error', () => {
+  eq(parseLine('$GPRMC,,A,4548.90000,N,01558.91400,E,,,,,,A*70').type, 'error');
+});
+test('No checksum is an error', () => {
+  eq(parseLine('$GPRMC,,A,4548.90000,N').type, 'error');
+});
+test('makePacket gives the same sentences as the firmware', () => {
+  const p = makePacket({ lat: 45.815, lon: 15.9819, altM: 123, sats: 8, hdop: 1.2,
+    id: 0x0a1b2c3d, seq: 42, battMv: 3700, rssi: -97, snr: 7, flags: 1, lost: 3 });
+  eq(p, FW.rmc + FW.gga + FW.st);
+});
+test('makePacket without a fix', () => {
+  const p = makePacket({ lat: 0, lon: 0, valid: false, id: 0x0a1b2c3d, seq: 42, battMv: 3700,
+    rssi: -97, snr: 7, flags: 1, lost: 3 });
+  eq(p, FW.rmcNoFix + FW.ggaNoFix + FW.st);
+});
+test('LineSplitter joins BLE chunks of 20 bytes', () => {
+  const s = new LineSplitter();
+  const all = FW.rmc + FW.gga + FW.st;
+  const lines = [];
+  for (let i = 0; i < all.length; i += 20) lines.push(...s.push(all.slice(i, i + 20)));
+  eq(lines.length, 3); eq(lines[2], FW.st.trim());
+});
+test('ReportBuilder makes one report for each packet', () => {
+  const reps = [];
+  const b = new ReportBuilder((r) => reps.push(r), () => 1000);
+  const s = new LineSplitter();
+  const text = makePacket({ lat: 45.8, lon: 16, seq: 1 }) + makePacket({ lat: 45.9, lon: 16.1, seq: 2 });
+  for (const l of s.push(text)) b.add(parseLine(l));
+  eq(reps.length, 2); eq(reps[0].seq, 1); eq(reps[1].seq, 2); eq(reps[1].id, '0A1B2C3D');
+  near(reps[1].lat, 45.9, 1e-6); eq(reps[1].sats, 8); eq(reps[1].t, 1000);
+});
+test('ReportBuilder: RMC without PGPST gives a report with id null', () => {
+  const reps = [];
+  const b = new ReportBuilder((r) => reps.push(r));
+  b.add(parseLine(FW.rmc)); b.add(parseLine(FW.gga)); b.add(parseLine(FW.rmc));
+  eq(reps.length, 1); eq(reps[0].id, null);
+});
+test('Distance: 1 degree of longitude on the equator', () => {
+  near(distanceM(0, 0, 0, 1), 111195, 1);
+});
+test('Bearing: north, east, south, west', () => {
+  near(bearingDeg(45, 16, 46, 16), 0, 1e-6);
+  near(bearingDeg(0, 16, 0, 17), 90, 1e-6);
+  near(bearingDeg(46, 16, 45, 16), 180, 1e-6);
+  near(bearingDeg(0, 17, 0, 16), 270, 1e-6);
+});
+test('LiPo percent', () => {
+  eq(lipoPercent(4200), 100); eq(lipoPercent(2900), 0); eq(lipoPercent(3750), 50);
+});
+test('Flag names', () => {
+  eq(flagNames(0x05).join(','), 'moving,low battery');
+});
+test('GPX', () => {
+  const g = toGpx({ '0A1B2C3D': [{ lat: 45.8, lon: 16, altM: 120, t: 0 }] });
+  if (!g.includes('<trkpt lat="45.8000000" lon="16.0000000"><ele>120</ele><time>1970-01-01T00:00:00.000Z</time>')) {
+    throw new Error(g);
+  }
+});
+
+const failed = results.filter((r) => !r[0]).length;
+document.getElementById('summary').innerHTML = failed
+  ? `<span class="fail">${failed} of ${results.length} tests failed</span>`
+  : `<span class="pass">All ${results.length} tests passed</span>`;
+document.getElementById('out').innerHTML = results
+  .map(([ok, n]) => `<span class="${ok ? 'pass' : 'fail'}">${ok ? 'PASS' : 'FAIL'}</span> ${n}`).join('\n');
+window.testResults = { total: results.length, failed };
+</script>
+</body>
+</html>
